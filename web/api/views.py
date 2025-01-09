@@ -12,15 +12,20 @@ from django.db.models import CharField, Count, F, Q, Value
 from django.utils import timezone
 from packaging import version
 from django.template.defaultfilters import slugify
+from django.utils.dateparse import parse_datetime
+
 from datetime import datetime
 from rest_framework import viewsets, status, mixins
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_204_NO_CONTENT, HTTP_202_ACCEPTED
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.cache import cache
 from django.contrib import messages
+from knox.auth import TokenAuthentication
 
 
 from dashboard.models import *
@@ -494,7 +499,8 @@ class CreateProjectApi(APIView):
 			)
 			response = {
 				'status': True,
-				'project_name': project_name
+				'project_name': project_name,
+				'project_id': project.id
 			}
 			return Response(response)
 		except Exception as e:
@@ -903,6 +909,9 @@ class AddReconNote(APIView):
 
 
 class ToggleSubdomainImportantStatus(APIView):
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
+
 	def post(self, request):
 		req = self.request
 		data = req.data
@@ -939,7 +948,7 @@ class AddTarget(APIView):
 		if not validators.domain(domain_name):
 			return Response({'status': False, 'message': 'Invalid domain or IP'})
 
-		status = bulk_import_targets(
+		status, created_targets, organization = bulk_import_targets(
 			targets=[{
 				'name': domain_name,
 				'description': description,
@@ -949,16 +958,17 @@ class AddTarget(APIView):
 			project_slug=slug
 		)
 
-		if status:
+		if status and created_targets:
 			return Response({
 				'status': True,
-				'message': 'Domain successfully added as target !',
+				'message': 'Domain successfully added as target.',
 				'domain_name': domain_name,
-				# 'domain_id': domain.id
+				'domain_id': created_targets[0].id,
+				"organization_id": organization.id
 			})
 		return Response({
 			'status': False,
-			'message': 'Failed to add as target !'
+			'message': 'Failed to add as target.'
 		})
 
 
@@ -1898,6 +1908,9 @@ class ListPorts(APIView):
 
 
 class ListSubdomains(APIView):
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
+
 	def get(self, request, format=None):
 		req = self.request
 		scan_id = req.query_params.get('scan_id')
@@ -1906,6 +1919,7 @@ class ListSubdomains(APIView):
 		ip_address = req.query_params.get('ip_address')
 		port = req.query_params.get('port')
 		tech = req.query_params.get('tech')
+		discovered_date_gt = req.query_params.get('discovered_date_gt')
 
 		subdomains = Subdomain.objects.filter(target_domain__project__slug=project) if project else Subdomain.objects.all()
 
@@ -1931,11 +1945,22 @@ class ListSubdomains(APIView):
 		if 'only_important' in req.query_params:
 			subdomain_query = subdomain_query.filter(is_important=True)
 
+		if discovered_date_gt:
+			try:
+				# Ensure discovered_date_gt is parsed correctly
+				parsed_date = parse_datetime(discovered_date_gt)
+				if parsed_date:
+					subdomain_query = subdomain_query.filter(discovered_date__gt=parsed_date)
+			except Exception:
+				pass
 
 		if 'no_lookup_interesting' in req.query_params:
 			serializer = OnlySubdomainNameSerializer(subdomain_query, many=True)
 		else:
 			serializer = SubdomainSerializer(subdomain_query, many=True)
+
+		# TODO: add discovered_date filter
+
 		return Response({"subdomains": serializer.data})
 
 	def post(self, req):
@@ -2883,6 +2908,7 @@ class VulnerabilityViewSet(viewsets.ModelViewSet):
 		subdomain_name = req.query_params.get('subdomain')
 		vulnerability_name = req.query_params.get('vulnerability_name')
 		slug = self.request.GET.get('project', None)
+		discovered_date_gt = req.query_params.get('discovered_date_gt')
 
 		if slug:
 			vulnerabilities = Vulnerability.objects.filter(scan_history__domain__project__slug=slug)
@@ -2919,6 +2945,16 @@ class VulnerabilityViewSet(viewsets.ModelViewSet):
 			qs = qs.filter(severity=severity)
 		if subdomain_id:
 			qs = qs.filter(subdomain__id=subdomain_id)
+
+		# Filter by discovered_date_gt
+		if discovered_date_gt:
+			try:
+				parsed_date = parse_datetime(discovered_date_gt)
+				if parsed_date:
+					qs = qs.filter(discovered_date__gt=parsed_date)
+			except Exception:
+				pass
+
 		self.queryset = qs
 		return self.queryset
 
@@ -3166,31 +3202,40 @@ class ScanViewSet(
     viewsets.GenericViewSet
 ):
 	queryset = ScanHistory.objects.none()
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
 	serializer_class = CreateScanHistorySerializer
 
 	def create(self, request: "Request", *args, **kwargs):
 		request.data['start_scan_date'] = timezone.now()
-		scan_history: ScanHistory = super().create(request, *args, **kwargs)
+
+		response = super().create(request, *args, **kwargs)
+
+		scan_history_id = response.data['id']
+		scan_history_instance = ScanHistory.objects.get(id=scan_history_id)
+
+		# TODO: update start_scan also on the domain
 
 		# Start the celery task
 		kwargs = {
-			'scan_history_id': scan_history.id,
-			'domain_id': scan_history.domain.id,
-			'engine_id': scan_history.scan_type.id,
+			'scan_history_id': scan_history_instance.id,
+			'domain_id': scan_history_instance.domain.id,
+			'engine_id': scan_history_instance.scan_type.id,
 			'scan_type': LIVE_SCAN,
 			'results_dir': '/usr/src/scan_results',
-			'imported_subdomains': scan_history.cfg_imported_subdomains,
-			'out_of_scope_subdomains': scan_history.cfg_out_of_scope_subdomains,
-			'starting_point_path': scan_history.cfg_starting_point_path,
-			'excluded_paths': scan_history.cfg_excluded_paths,
-			'initiated_by_id': scan_history.initiated_by
+			'imported_subdomains': scan_history_instance.cfg_imported_subdomains,
+			'out_of_scope_subdomains': scan_history_instance.cfg_out_of_scope_subdomains,
+			'starting_point_path': scan_history_instance.cfg_starting_point_path or "",
+			'excluded_paths': scan_history_instance.cfg_excluded_paths,
+			'initiated_by_id': scan_history_instance.initiated_by.id if scan_history_instance.initiated_by else None
 		}
+
 		initiate_scan.apply_async(kwargs=kwargs)
 
 		# Send start notif
 		messages.add_message(
 			request,
 			messages.INFO,
-			f'Scan Started for {scan_history.domain.name}')
+			f'Scan Started for {scan_history_instance.domain.name}')
 
-		return scan_history
+		return response

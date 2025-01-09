@@ -884,6 +884,7 @@ class SubdomainSerializer(serializers.ModelSerializer):
 	waf = WafSerializer(many=True)
 	technologies = TechnologySerializer(many=True)
 	directories = DirectoryScanSerializer(many=True)
+	organization_id = serializers.SerializerMethodField()
 
 
 	class Meta:
@@ -931,6 +932,9 @@ class SubdomainSerializer(serializers.ModelSerializer):
 		except:
 			return None
 
+	def get_organization_id(self, obj: Subdomain):
+		return obj.target_domain.get_organization().first().id
+
 
 class EndpointSerializer(serializers.ModelSerializer):
 
@@ -950,11 +954,12 @@ class EndpointOnlyURLsSerializer(serializers.ModelSerializer):
 
 class VulnerabilitySerializer(serializers.ModelSerializer):
 
-	discovered_date = serializers.SerializerMethodField()
+	# discovered_date = serializers.SerializerMethodField()
 	severity = serializers.SerializerMethodField()
+	organization_id = serializers.SerializerMethodField()
 
-	def get_discovered_date(self, Vulnerability):
-		return Vulnerability.discovered_date.strftime("%b %d, %Y %H:%M")
+	# def get_discovered_date(self, Vulnerability):
+	# 	return Vulnerability.discovered_date.strftime("%b %d, %Y %H:%M")
 
 	def get_severity(self, Vulnerability):
 		if Vulnerability.severity == 0:
@@ -971,6 +976,9 @@ class VulnerabilitySerializer(serializers.ModelSerializer):
 			return "Unknown"
 		else:
 			return "Unknown"
+
+	def get_organization_id(self, obj: Subdomain):
+		return obj.target_domain.get_organization().first().id
 
 	class Meta:
 		model = Vulnerability
