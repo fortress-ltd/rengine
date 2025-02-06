@@ -13,7 +13,7 @@ router.register(r'listTargets', ListTargetsDatatableViewSet)
 router.register(r'listSubdomains', SubdomainsViewSet, basename='subdomains2')
 router.register(r'listEndpoints', EndPointViewSet)
 router.register(r'listDirectories', DirectoryViewSet)
-router.register(r'listVulnerability', VulnerabilityViewSet)
+router.register(r'listVulnerability', ListVulnerabilityViewSet)
 router.register(r'listInterestingSubdomains', InterestingSubdomainViewSet, basename='intresting-subdomains')
 router.register(r'listInterestingEndpoints', InterestingEndpointViewSet, basename='intresting-endpoints')
 router.register(r'listSubdomainChanges', SubdomainChangesViewSet, basename='subdomain-changes')
@@ -24,6 +24,7 @@ router.register(r'listScanLogs', ListScanLogsViewSet, 'list-scan-logs')
 router.register(r'notifications', InAppNotificationManagerViewSet, basename='notification')
 router.register(r'hackerone-programs', HackerOneProgramViewSet, basename='hackerone_program')
 router.register(r'scans', ScanViewSet)
+router.register(r'vulnerabilities', VulnerabilityViewSet)
 
 urlpatterns = router.urls + [
     # url('^', include(router.urls)),

@@ -2898,6 +2898,312 @@ class DirectoryViewSet(viewsets.ModelViewSet):
 		return self.queryset
 
 
+class ListVulnerabilityViewSet(
+	mixins.ListModelMixin,
+	viewsets.GenericViewSet
+):
+	queryset = Vulnerability.objects.none()
+	serializer_class = VulnerabilitySerializer
+
+	def get_queryset(self):
+		req = self.request
+		scan_id = req.query_params.get('scan_history')
+		target_id = req.query_params.get('target_id')
+		domain = req.query_params.get('domain')
+		severity = req.query_params.get('severity')
+		subdomain_id = req.query_params.get('subdomain_id')
+		subdomain_name = req.query_params.get('subdomain')
+		vulnerability_name = req.query_params.get('vulnerability_name')
+		slug = self.request.GET.get('project', None)
+		discovered_date_gt = req.query_params.get('discovered_date_gt')
+
+		if slug:
+			vulnerabilities = Vulnerability.objects.filter(scan_history__domain__project__slug=slug)
+		else:
+			vulnerabilities = Vulnerability.objects.all()
+
+		if scan_id:
+			qs = (
+				vulnerabilities
+				.filter(scan_history__id=scan_id)
+				.distinct()
+			)
+		elif target_id:
+			qs = (
+				vulnerabilities
+				.filter(target_domain__id=target_id)
+				.distinct()
+			)
+		elif subdomain_name:
+			subdomains = Subdomain.objects.filter(name=subdomain_name)
+			qs = (
+				vulnerabilities
+				.filter(subdomain__in=subdomains)
+				.distinct()
+			)
+		else:
+			qs = vulnerabilities.distinct()
+
+		if domain:
+			qs = qs.filter(Q(target_domain__name=domain)).distinct()
+		if vulnerability_name:
+			qs = qs.filter(Q(name=vulnerability_name)).distinct()
+		if severity:
+			qs = qs.filter(severity=severity)
+		if subdomain_id:
+			qs = qs.filter(subdomain__id=subdomain_id)
+
+		# Filter by discovered_date_gt
+		if discovered_date_gt:
+			try:
+				parsed_date = parse_datetime(discovered_date_gt)
+				if parsed_date:
+					qs = qs.filter(discovered_date__gt=parsed_date)
+			except Exception:
+				pass
+
+		self.queryset = qs
+		return self.queryset
+
+	def filter_queryset(self, qs):
+		qs = self.queryset.filter()
+		search_value = self.request.GET.get(u'search[value]', None)
+		_order_col = self.request.GET.get(u'order[0][column]', None)
+		_order_direction = self.request.GET.get(u'order[0][dir]', None)
+		if search_value or _order_col or _order_direction:
+			order_col = 'severity'
+			if _order_col == '1':
+				order_col = 'source'
+			elif _order_col == '3':
+				order_col = 'name'
+			elif _order_col == '7':
+				order_col = 'severity'
+			elif _order_col == '11':
+				order_col = 'http_url'
+			elif _order_col == '15':
+				order_col = 'open_status'
+
+			if _order_direction == 'desc':
+				order_col = f'-{order_col}'
+			# if the search query is separated by = means, it is a specific lookup
+			# divide the search query into two half and lookup
+			operators = ['=', '&', '|', '>', '<', '!']
+			if any(x in search_value for x in operators):
+				if '&' in search_value:
+					complex_query = search_value.split('&')
+					for query in complex_query:
+						if query.strip():
+							qs = qs & self.special_lookup(query.strip())
+				elif '|' in search_value:
+					qs = Subdomain.objects.none()
+					complex_query = search_value.split('|')
+					for query in complex_query:
+						if query.strip():
+							qs = self.special_lookup(query.strip()) | qs
+				else:
+					qs = self.special_lookup(search_value)
+			else:
+				qs = self.general_lookup(search_value)
+			return qs.order_by(order_col)
+		return qs.order_by('-severity')
+
+	def general_lookup(self, search_value):
+		qs = (
+			self.queryset
+			.filter(Q(http_url__icontains=search_value) |
+					Q(target_domain__name__icontains=search_value) |
+					Q(template__icontains=search_value) |
+					Q(template_id__icontains=search_value) |
+					Q(name__icontains=search_value) |
+					Q(severity__icontains=search_value) |
+					Q(description__icontains=search_value) |
+					Q(extracted_results__icontains=search_value) |
+					Q(references__url__icontains=search_value) |
+					Q(cve_ids__name__icontains=search_value) |
+					Q(cwe_ids__name__icontains=search_value) |
+					Q(cvss_metrics__icontains=search_value) |
+					Q(cvss_score__icontains=search_value) |
+					Q(type__icontains=search_value) |
+					Q(open_status__icontains=search_value) |
+					Q(hackerone_report_id__icontains=search_value) |
+					Q(tags__name__icontains=search_value))
+		)
+		return qs
+
+	def special_lookup(self, search_value):
+		qs = self.queryset.filter()
+		if '=' in search_value:
+			search_param = search_value.split("=")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'severity' in lookup_title:
+				severity_value = NUCLEI_SEVERITY_MAP.get(lookup_content, -1)
+				qs = (
+					self.queryset
+					.filter(severity=severity_value)
+				)
+			elif 'name' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(name__icontains=lookup_content)
+				)
+			elif 'http_url' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(http_url__icontains=lookup_content)
+				)
+			elif 'template' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(template__icontains=lookup_content)
+				)
+			elif 'template_id' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(template_id__icontains=lookup_content)
+				)
+			elif 'cve_id' in lookup_title or 'cve' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cve_ids__name__icontains=lookup_content)
+				)
+			elif 'cwe_id' in lookup_title or 'cwe' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cwe_ids__name__icontains=lookup_content)
+				)
+			elif 'cvss_metrics' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cvss_metrics__icontains=lookup_content)
+				)
+			elif 'cvss_score' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cvss_score__exact=lookup_content)
+				)
+			elif 'type' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(type__icontains=lookup_content)
+				)
+			elif 'tag' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(tags__name__icontains=lookup_content)
+				)
+			elif 'status' in lookup_title:
+				open_status = lookup_content == 'open'
+				qs = (
+					self.queryset
+					.filter(open_status=open_status)
+				)
+			elif 'description' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(Q(description__icontains=lookup_content) |
+							Q(template__icontains=lookup_content) |
+							Q(extracted_results__icontains=lookup_content))
+				)
+		elif '!' in search_value:
+			search_param = search_value.split("!")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'severity' in lookup_title:
+				severity_value = NUCLEI_SEVERITY_MAP.get(lookup_title, -1)
+				qs = (
+					self.queryset
+					.exclude(severity=severity_value)
+				)
+			elif 'name' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(name__icontains=lookup_content)
+				)
+			elif 'http_url' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(http_url__icontains=lookup_content)
+				)
+			elif 'template' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(template__icontains=lookup_content)
+				)
+			elif 'template_id' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(template_id__icontains=lookup_content)
+				)
+			elif 'cve_id' in lookup_title or 'cve' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cve_ids__icontains=lookup_content)
+				)
+			elif 'cwe_id' in lookup_title or 'cwe' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cwe_ids__icontains=lookup_content)
+				)
+			elif 'cvss_metrics' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cvss_metrics__icontains=lookup_content)
+				)
+			elif 'cvss_score' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cvss_score__exact=lookup_content)
+				)
+			elif 'type' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(type__icontains=lookup_content)
+				)
+			elif 'tag' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(tags__icontains=lookup_content)
+				)
+			elif 'status' in lookup_title:
+				open_status = lookup_content == 'open'
+				qs = (
+					self.queryset
+					.exclude(open_status=open_status)
+				)
+			elif 'description' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(Q(description__icontains=lookup_content) |
+							 Q(template__icontains=lookup_content) |
+							 Q(extracted_results__icontains=lookup_content))
+				)
+
+		elif '>' in search_value:
+			search_param = search_value.split(">")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'cvss_score' in lookup_title:
+				try:
+					val = float(lookup_content)
+					qs = self.queryset.filter(cvss_score__gt=val)
+				except Exception as e:
+					print(e)
+
+		elif '<' in search_value:
+			search_param = search_value.split("<")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'cvss_score' in lookup_title:
+				try:
+					val = int(lookup_content)
+					qs = self.queryset.filter(cvss_score__lt=val)
+				except Exception as e:
+					print(e)
+
+		return qs
+
+
 class VulnerabilityViewSet(
 	mixins.ListModelMixin,
 	viewsets.GenericViewSet
