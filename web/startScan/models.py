@@ -479,6 +479,9 @@ class Vulnerability(models.Model):
 	description = models.TextField(null=True, blank=True)
 	impact = models.TextField(null=True, blank=True)
 	remediation = models.TextField(null=True, blank=True)
+	epss_score = models.FloatField(null=True, blank=True, default=None)
+	epss_percentile = models.FloatField(null=True, blank=True, default=None)
+	cpe = models.TextField(null=True, blank=True)
 
 	extracted_results = ArrayField(
 		models.CharField(max_length=5000), blank=True, null=True
