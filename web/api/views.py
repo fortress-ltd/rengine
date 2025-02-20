@@ -12,15 +12,20 @@ from django.db.models import CharField, Count, F, Q, Value
 from django.utils import timezone
 from packaging import version
 from django.template.defaultfilters import slugify
+from django.utils.dateparse import parse_datetime
+
 from datetime import datetime
 from rest_framework import viewsets, status, mixins
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_204_NO_CONTENT, HTTP_202_ACCEPTED
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.cache import cache
 from django.contrib import messages
+from knox.auth import TokenAuthentication
 
 
 from dashboard.models import *
@@ -494,7 +499,8 @@ class CreateProjectApi(APIView):
 			)
 			response = {
 				'status': True,
-				'project_name': project_name
+				'project_name': project_name,
+				'project_id': project.id
 			}
 			return Response(response)
 		except Exception as e:
@@ -903,6 +909,9 @@ class AddReconNote(APIView):
 
 
 class ToggleSubdomainImportantStatus(APIView):
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
+
 	def post(self, request):
 		req = self.request
 		data = req.data
@@ -921,6 +930,10 @@ class ToggleSubdomainImportantStatus(APIView):
 
 
 class AddTarget(APIView):
+	# TODO: CRITICAL: remove this or separate view
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
+
 	def post(self, request):
 		req = self.request
 		data = req.data
@@ -939,7 +952,7 @@ class AddTarget(APIView):
 		if not validators.domain(domain_name):
 			return Response({'status': False, 'message': 'Invalid domain or IP'})
 
-		status = bulk_import_targets(
+		status, created_targets, organization = bulk_import_targets(
 			targets=[{
 				'name': domain_name,
 				'description': description,
@@ -949,16 +962,17 @@ class AddTarget(APIView):
 			project_slug=slug
 		)
 
-		if status:
+		if status and created_targets:
 			return Response({
 				'status': True,
-				'message': 'Domain successfully added as target !',
+				'message': 'Domain successfully added as target.',
 				'domain_name': domain_name,
-				# 'domain_id': domain.id
+				'domain_id': created_targets[0].id,
+				"organization_id": organization.id if organization else None
 			})
 		return Response({
 			'status': False,
-			'message': 'Failed to add as target !'
+			'message': 'Failed to add as target.'
 		})
 
 
@@ -1898,6 +1912,9 @@ class ListPorts(APIView):
 
 
 class ListSubdomains(APIView):
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
+
 	def get(self, request, format=None):
 		req = self.request
 		scan_id = req.query_params.get('scan_id')
@@ -1906,6 +1923,7 @@ class ListSubdomains(APIView):
 		ip_address = req.query_params.get('ip_address')
 		port = req.query_params.get('port')
 		tech = req.query_params.get('tech')
+		discovered_date_gt = req.query_params.get('discovered_date_gt')
 
 		subdomains = Subdomain.objects.filter(target_domain__project__slug=project) if project else Subdomain.objects.all()
 
@@ -1931,11 +1949,22 @@ class ListSubdomains(APIView):
 		if 'only_important' in req.query_params:
 			subdomain_query = subdomain_query.filter(is_important=True)
 
+		if discovered_date_gt:
+			try:
+				# Ensure discovered_date_gt is parsed correctly
+				parsed_date = parse_datetime(discovered_date_gt)
+				if parsed_date:
+					subdomain_query = subdomain_query.filter(discovered_date__gt=parsed_date)
+			except Exception:
+				pass
 
 		if 'no_lookup_interesting' in req.query_params:
 			serializer = OnlySubdomainNameSerializer(subdomain_query, many=True)
 		else:
 			serializer = SubdomainSerializer(subdomain_query, many=True)
+
+		# TODO: add discovered_date filter
+
 		return Response({"subdomains": serializer.data})
 
 	def post(self, req):
@@ -2869,7 +2898,10 @@ class DirectoryViewSet(viewsets.ModelViewSet):
 		return self.queryset
 
 
-class VulnerabilityViewSet(viewsets.ModelViewSet):
+class ListVulnerabilityViewSet(
+	mixins.ListModelMixin,
+	viewsets.GenericViewSet
+):
 	queryset = Vulnerability.objects.none()
 	serializer_class = VulnerabilitySerializer
 
@@ -2883,6 +2915,7 @@ class VulnerabilityViewSet(viewsets.ModelViewSet):
 		subdomain_name = req.query_params.get('subdomain')
 		vulnerability_name = req.query_params.get('vulnerability_name')
 		slug = self.request.GET.get('project', None)
+		discovered_date_gt = req.query_params.get('discovered_date_gt')
 
 		if slug:
 			vulnerabilities = Vulnerability.objects.filter(scan_history__domain__project__slug=slug)
@@ -2919,6 +2952,324 @@ class VulnerabilityViewSet(viewsets.ModelViewSet):
 			qs = qs.filter(severity=severity)
 		if subdomain_id:
 			qs = qs.filter(subdomain__id=subdomain_id)
+
+		# Filter by discovered_date_gt
+		if discovered_date_gt:
+			try:
+				parsed_date = parse_datetime(discovered_date_gt)
+				if parsed_date:
+					qs = qs.filter(discovered_date__gt=parsed_date)
+			except Exception:
+				pass
+
+		self.queryset = qs
+		return self.queryset
+
+	def filter_queryset(self, qs):
+		qs = self.queryset.filter()
+		search_value = self.request.GET.get(u'search[value]', None)
+		_order_col = self.request.GET.get(u'order[0][column]', None)
+		_order_direction = self.request.GET.get(u'order[0][dir]', None)
+		if search_value or _order_col or _order_direction:
+			order_col = 'severity'
+			if _order_col == '1':
+				order_col = 'source'
+			elif _order_col == '3':
+				order_col = 'name'
+			elif _order_col == '7':
+				order_col = 'severity'
+			elif _order_col == '11':
+				order_col = 'http_url'
+			elif _order_col == '15':
+				order_col = 'open_status'
+
+			if _order_direction == 'desc':
+				order_col = f'-{order_col}'
+			# if the search query is separated by = means, it is a specific lookup
+			# divide the search query into two half and lookup
+			operators = ['=', '&', '|', '>', '<', '!']
+			if any(x in search_value for x in operators):
+				if '&' in search_value:
+					complex_query = search_value.split('&')
+					for query in complex_query:
+						if query.strip():
+							qs = qs & self.special_lookup(query.strip())
+				elif '|' in search_value:
+					qs = Subdomain.objects.none()
+					complex_query = search_value.split('|')
+					for query in complex_query:
+						if query.strip():
+							qs = self.special_lookup(query.strip()) | qs
+				else:
+					qs = self.special_lookup(search_value)
+			else:
+				qs = self.general_lookup(search_value)
+			return qs.order_by(order_col)
+		return qs.order_by('-severity')
+
+	def general_lookup(self, search_value):
+		qs = (
+			self.queryset
+			.filter(Q(http_url__icontains=search_value) |
+					Q(target_domain__name__icontains=search_value) |
+					Q(template__icontains=search_value) |
+					Q(template_id__icontains=search_value) |
+					Q(name__icontains=search_value) |
+					Q(severity__icontains=search_value) |
+					Q(description__icontains=search_value) |
+					Q(extracted_results__icontains=search_value) |
+					Q(references__url__icontains=search_value) |
+					Q(cve_ids__name__icontains=search_value) |
+					Q(cwe_ids__name__icontains=search_value) |
+					Q(cvss_metrics__icontains=search_value) |
+					Q(cvss_score__icontains=search_value) |
+					Q(type__icontains=search_value) |
+					Q(open_status__icontains=search_value) |
+					Q(hackerone_report_id__icontains=search_value) |
+					Q(tags__name__icontains=search_value))
+		)
+		return qs
+
+	def special_lookup(self, search_value):
+		qs = self.queryset.filter()
+		if '=' in search_value:
+			search_param = search_value.split("=")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'severity' in lookup_title:
+				severity_value = NUCLEI_SEVERITY_MAP.get(lookup_content, -1)
+				qs = (
+					self.queryset
+					.filter(severity=severity_value)
+				)
+			elif 'name' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(name__icontains=lookup_content)
+				)
+			elif 'http_url' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(http_url__icontains=lookup_content)
+				)
+			elif 'template' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(template__icontains=lookup_content)
+				)
+			elif 'template_id' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(template_id__icontains=lookup_content)
+				)
+			elif 'cve_id' in lookup_title or 'cve' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cve_ids__name__icontains=lookup_content)
+				)
+			elif 'cwe_id' in lookup_title or 'cwe' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cwe_ids__name__icontains=lookup_content)
+				)
+			elif 'cvss_metrics' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cvss_metrics__icontains=lookup_content)
+				)
+			elif 'cvss_score' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(cvss_score__exact=lookup_content)
+				)
+			elif 'type' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(type__icontains=lookup_content)
+				)
+			elif 'tag' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(tags__name__icontains=lookup_content)
+				)
+			elif 'status' in lookup_title:
+				open_status = lookup_content == 'open'
+				qs = (
+					self.queryset
+					.filter(open_status=open_status)
+				)
+			elif 'description' in lookup_title:
+				qs = (
+					self.queryset
+					.filter(Q(description__icontains=lookup_content) |
+							Q(template__icontains=lookup_content) |
+							Q(extracted_results__icontains=lookup_content))
+				)
+		elif '!' in search_value:
+			search_param = search_value.split("!")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'severity' in lookup_title:
+				severity_value = NUCLEI_SEVERITY_MAP.get(lookup_title, -1)
+				qs = (
+					self.queryset
+					.exclude(severity=severity_value)
+				)
+			elif 'name' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(name__icontains=lookup_content)
+				)
+			elif 'http_url' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(http_url__icontains=lookup_content)
+				)
+			elif 'template' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(template__icontains=lookup_content)
+				)
+			elif 'template_id' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(template_id__icontains=lookup_content)
+				)
+			elif 'cve_id' in lookup_title or 'cve' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cve_ids__icontains=lookup_content)
+				)
+			elif 'cwe_id' in lookup_title or 'cwe' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cwe_ids__icontains=lookup_content)
+				)
+			elif 'cvss_metrics' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cvss_metrics__icontains=lookup_content)
+				)
+			elif 'cvss_score' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(cvss_score__exact=lookup_content)
+				)
+			elif 'type' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(type__icontains=lookup_content)
+				)
+			elif 'tag' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(tags__icontains=lookup_content)
+				)
+			elif 'status' in lookup_title:
+				open_status = lookup_content == 'open'
+				qs = (
+					self.queryset
+					.exclude(open_status=open_status)
+				)
+			elif 'description' in lookup_title:
+				qs = (
+					self.queryset
+					.exclude(Q(description__icontains=lookup_content) |
+							 Q(template__icontains=lookup_content) |
+							 Q(extracted_results__icontains=lookup_content))
+				)
+
+		elif '>' in search_value:
+			search_param = search_value.split(">")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'cvss_score' in lookup_title:
+				try:
+					val = float(lookup_content)
+					qs = self.queryset.filter(cvss_score__gt=val)
+				except Exception as e:
+					print(e)
+
+		elif '<' in search_value:
+			search_param = search_value.split("<")
+			lookup_title = search_param[0].lower().strip()
+			lookup_content = search_param[1].lower().strip()
+			if 'cvss_score' in lookup_title:
+				try:
+					val = int(lookup_content)
+					qs = self.queryset.filter(cvss_score__lt=val)
+				except Exception as e:
+					print(e)
+
+		return qs
+
+
+class VulnerabilityViewSet(
+	mixins.ListModelMixin,
+	viewsets.GenericViewSet
+):
+	queryset = Vulnerability.objects.none()
+	authentication_classes = (TokenAuthentication,) # TODO: remove this or separate view.
+	permission_classes = (IsAuthenticated,) # TODO: remove this or separate view.
+	serializer_class = VulnerabilitySerializer
+
+	def get_queryset(self):
+		req = self.request
+		scan_id = req.query_params.get('scan_history')
+		target_id = req.query_params.get('target_id')
+		domain = req.query_params.get('domain')
+		severity = req.query_params.get('severity')
+		subdomain_id = req.query_params.get('subdomain_id')
+		subdomain_name = req.query_params.get('subdomain')
+		vulnerability_name = req.query_params.get('vulnerability_name')
+		slug = self.request.GET.get('project', None)
+		discovered_date_gt = req.query_params.get('discovered_date_gt')
+
+		if slug:
+			vulnerabilities = Vulnerability.objects.filter(scan_history__domain__project__slug=slug)
+		else:
+			vulnerabilities = Vulnerability.objects.all()
+
+		if scan_id:
+			qs = (
+				vulnerabilities
+				.filter(scan_history__id=scan_id)
+				.distinct()
+			)
+		elif target_id:
+			qs = (
+				vulnerabilities
+				.filter(target_domain__id=target_id)
+				.distinct()
+			)
+		elif subdomain_name:
+			subdomains = Subdomain.objects.filter(name=subdomain_name)
+			qs = (
+				vulnerabilities
+				.filter(subdomain__in=subdomains)
+				.distinct()
+			)
+		else:
+			qs = vulnerabilities.distinct()
+
+		if domain:
+			qs = qs.filter(Q(target_domain__name=domain)).distinct()
+		if vulnerability_name:
+			qs = qs.filter(Q(name=vulnerability_name)).distinct()
+		if severity:
+			qs = qs.filter(severity=severity)
+		if subdomain_id:
+			qs = qs.filter(subdomain__id=subdomain_id)
+
+		# Filter by discovered_date_gt
+		if discovered_date_gt:
+			try:
+				parsed_date = parse_datetime(discovered_date_gt)
+				if parsed_date:
+					qs = qs.filter(discovered_date__gt=parsed_date)
+			except Exception:
+				pass
+
 		self.queryset = qs
 		return self.queryset
 
@@ -3166,31 +3517,40 @@ class ScanViewSet(
     viewsets.GenericViewSet
 ):
 	queryset = ScanHistory.objects.none()
+	authentication_classes = (TokenAuthentication,)
+	permission_classes = (IsAuthenticated,)
 	serializer_class = CreateScanHistorySerializer
 
 	def create(self, request: "Request", *args, **kwargs):
 		request.data['start_scan_date'] = timezone.now()
-		scan_history: ScanHistory = super().create(request, *args, **kwargs)
+
+		response = super().create(request, *args, **kwargs)
+
+		scan_history_id = response.data['id']
+		scan_history_instance = ScanHistory.objects.get(id=scan_history_id)
+
+		# TODO: update start_scan also on the domain
 
 		# Start the celery task
 		kwargs = {
-			'scan_history_id': scan_history.id,
-			'domain_id': scan_history.domain.id,
-			'engine_id': scan_history.scan_type.id,
+			'scan_history_id': scan_history_instance.id,
+			'domain_id': scan_history_instance.domain.id,
+			'engine_id': scan_history_instance.scan_type.id,
 			'scan_type': LIVE_SCAN,
 			'results_dir': '/usr/src/scan_results',
-			'imported_subdomains': scan_history.cfg_imported_subdomains,
-			'out_of_scope_subdomains': scan_history.cfg_out_of_scope_subdomains,
-			'starting_point_path': scan_history.cfg_starting_point_path,
-			'excluded_paths': scan_history.cfg_excluded_paths,
-			'initiated_by_id': scan_history.initiated_by
+			'imported_subdomains': scan_history_instance.cfg_imported_subdomains,
+			'out_of_scope_subdomains': scan_history_instance.cfg_out_of_scope_subdomains,
+			'starting_point_path': scan_history_instance.cfg_starting_point_path or "",
+			'excluded_paths': scan_history_instance.cfg_excluded_paths,
+			'initiated_by_id': scan_history_instance.initiated_by.id if scan_history_instance.initiated_by else None
 		}
+
 		initiate_scan.apply_async(kwargs=kwargs)
 
 		# Send start notif
 		messages.add_message(
 			request,
 			messages.INFO,
-			f'Scan Started for {scan_history.domain.name}')
+			f'Scan Started for {scan_history_instance.domain.name}')
 
-		return scan_history
+		return response
